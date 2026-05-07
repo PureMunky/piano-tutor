@@ -45,6 +45,16 @@ export function playNote(note: string, duration: string = '4n'): void {
   sampler.triggerAttackRelease(note, duration);
 }
 
+export function triggerAttack(note: string): void {
+  if (!sampler || !samplerReady) return;
+  sampler.triggerAttack(note);
+}
+
+export function triggerRelease(note: string): void {
+  if (!sampler || !samplerReady) return;
+  sampler.triggerRelease(note);
+}
+
 export async function playSequence(
   notes: NoteEvent[],
   bpm: number,

@@ -3,14 +3,40 @@ import { pitchDetector, type PitchEvent } from '../core/pitch-detector';
 import { vexKeyToNoteName, notesEqual } from '../core/note-utils';
 import { calculateScore } from './scoring';
 
+export interface PlayedNote {
+  note: string;
+  expectedNote: string;
+  expectedIndex: number;
+  startMs: number;
+  durationMs: number;
+  expectedStartMs: number;
+  expectedDurationMs: number;
+  source: 'mic' | 'click';
+}
+
 export type ExerciseCallback = {
+  onCursorAdvance: (index: number, expectedNote: string | null) => void;
   onNoteCorrect: (index: number, note: string) => void;
   onNoteWrong: (expectedNote: string, playedNote: string) => void;
-  onComplete: (score: ExerciseScore) => void;
   onNoteDetected: (note: string) => void;
-  onHoldProgress: (index: number, progress: number) => void; // 0-1 progress through hold
-  onNoteAdvance: (index: number) => void; // note fully held, moving to next
+  onSlotProgress: (index: number, progress: number) => void;
+  onPlayedNote: (played: PlayedNote) => void;
+  onMissed: (index: number, expectedNote: string) => void;
+  onComplete: (score: ExerciseScore, played: PlayedNote[]) => void;
 };
+
+interface Slot {
+  expectedNotes: string[];
+  startMs: number;
+  endMs: number;
+  rest: boolean;
+}
+
+const MIC_DETECTION_LATENCY_MS = 90;
+const MIC_HOLD_TOLERANCE_MS = 180;
+// Ignore mic detections of the previous slot's note for this long after
+// a cursor advance — it's almost certainly the previous note still ringing.
+const RESONANCE_GUARD_MS = 200;
 
 function durationToBeats(dur: string): number {
   switch (dur) {
@@ -19,7 +45,6 @@ function durationToBeats(dur: string): number {
     case 'q': return 1;
     case '8': return 0.5;
     case '16': return 0.25;
-    // dotted variants
     case 'hd': return 3;
     case 'qd': return 1.5;
     default: return 1;
@@ -27,60 +52,86 @@ function durationToBeats(dur: string): number {
 }
 
 function beatsToMs(beats: number, bpm: number): number {
-  // One beat = 60000 / bpm milliseconds
   return (beats * 60000) / bpm;
 }
 
 export class ExerciseRunner {
   private exercise: ExerciseStep;
   private bpm: number;
-  private cursor: number = 0;
-  private correctCount: number = 0;
-  private wrongCount: number = 0;
   private callbacks: ExerciseCallback;
-  private unsubscribe: (() => void) | null = null;
-  private active: boolean = false;
 
-  // Hold tracking: once the right note is detected, we require it to be
-  // held (i.e. continuously detected) for the note's full duration.
-  private holdingCorrectNote: boolean = false;
-  private holdStartTime: number = 0;
-  private holdDurationMs: number = 0;
-  private holdTimerId: number = 0;
-  private holdCheckId: number = 0;
+  private schedule: Slot[] = [];
+  private totalMs: number = 0;
+
+  private cursor: number = -1;
+  private active: boolean = false;
+  private startTime: number = 0;
+  private rafId: number = 0;
+  private unsubscribe: (() => void) | null = null;
+
+  private slotAttempt: { startMs: number; releaseMs: number; note: string; source: 'mic' | 'click' } | null = null;
+  private wrongCount: number = 0;
+  private playedNotes: PlayedNote[] = [];
+
+  private heldNote: string | null = null;
   private lastDetectedNote: string = '';
   private lastDetectedTime: number = 0;
+  private prevSlotNote: string | null = null;
+  private cursorAdvanceTime: number = 0;
 
   constructor(exercise: ExerciseStep, callbacks: ExerciseCallback, bpm: number) {
     this.exercise = exercise;
     this.callbacks = callbacks;
     this.bpm = bpm;
+    this.buildSchedule();
   }
 
   setBpm(bpm: number): void {
     this.bpm = bpm;
+    this.buildSchedule();
+  }
+
+  private buildSchedule(): void {
+    this.schedule = [];
+    let beatPos = 0;
+    for (const n of this.exercise.notes) {
+      const beats = durationToBeats(n.duration);
+      const startMs = beatsToMs(beatPos, this.bpm);
+      const endMs = beatsToMs(beatPos + beats, this.bpm);
+      this.schedule.push({
+        expectedNotes: n.keys.map(k => vexKeyToNoteName(k)),
+        startMs,
+        endMs,
+        rest: !!n.rest,
+      });
+      beatPos += beats;
+    }
+    this.totalMs = beatsToMs(beatPos, this.bpm);
   }
 
   async start(): Promise<void> {
-    this.cursor = 0;
-    this.correctCount = 0;
+    this.cursor = -1;
     this.wrongCount = 0;
+    this.playedNotes = [];
+    this.slotAttempt = null;
+    this.heldNote = null;
+    this.prevSlotNote = null;
     this.active = true;
-    this.holdingCorrectNote = false;
-
-    // Skip leading rests
-    this.skipRests();
+    this.startTime = performance.now();
+    this.cursorAdvanceTime = this.startTime;
 
     if (!pitchDetector.isListening()) {
       await pitchDetector.startListening();
     }
-
     this.unsubscribe = pitchDetector.onPitch(this.handlePitch);
+
+    this.rafId = requestAnimationFrame(this.tick);
   }
 
   stop(): void {
     this.active = false;
-    this.cancelHold();
+    if (this.rafId) cancelAnimationFrame(this.rafId);
+    this.rafId = 0;
     if (this.unsubscribe) {
       this.unsubscribe();
       this.unsubscribe = null;
@@ -89,124 +140,187 @@ export class ExerciseRunner {
 
   reset(): void {
     this.stop();
-    this.cursor = 0;
-    this.correctCount = 0;
+    this.cursor = -1;
     this.wrongCount = 0;
-    this.holdingCorrectNote = false;
+    this.playedNotes = [];
+    this.slotAttempt = null;
   }
 
   getCursor(): number {
     return this.cursor;
   }
 
-  private skipRests(): void {
-    while (this.cursor < this.exercise.notes.length && this.exercise.notes[this.cursor].rest) {
-      this.cursor++;
-    }
+  getPlayedNotes(): PlayedNote[] {
+    return this.playedNotes;
   }
 
-  private cancelHold(): void {
-    if (this.holdTimerId) {
-      clearTimeout(this.holdTimerId);
-      this.holdTimerId = 0;
+  noteOn(note: string): void {
+    if (!this.active) return;
+    this.heldNote = note;
+    this.tryRecordAttempt(note, 'click', performance.now());
+    this.callbacks.onNoteDetected(note);
+  }
+
+  noteOff(note: string): void {
+    if (this.heldNote === note) {
+      this.heldNote = null;
     }
-    if (this.holdCheckId) {
-      cancelAnimationFrame(this.holdCheckId);
-      this.holdCheckId = 0;
-    }
-    this.holdingCorrectNote = false;
   }
 
   private handlePitch = (event: PitchEvent): void => {
     if (!this.active) return;
-    if (this.cursor >= this.exercise.notes.length) return;
 
     this.lastDetectedNote = event.note;
     this.lastDetectedTime = performance.now();
-
     this.callbacks.onNoteDetected(event.note);
 
-    // If we're already holding the correct note, the hold-check loop handles progress.
-    // A wrong note during a hold will cancel it (handled in the hold check).
-    if (this.holdingCorrectNote) return;
-
-    const expected = this.exercise.notes[this.cursor];
-    const expectedNotes = expected.keys.map(k => vexKeyToNoteName(k));
-
-    const isCorrect = expectedNotes.some(en => notesEqual(en, event.note));
-
-    if (isCorrect) {
-      // Start the hold period
-      const beats = durationToBeats(expected.duration);
-      this.holdDurationMs = beatsToMs(beats, this.bpm);
-
-      // Minimum hold of 200ms even for very fast tempos, so it doesn't feel instant
-      this.holdDurationMs = Math.max(this.holdDurationMs, 200);
-
-      this.holdingCorrectNote = true;
-      this.holdStartTime = performance.now();
-
-      // Notify that the correct note was initially detected
-      this.callbacks.onNoteCorrect(this.cursor, event.note);
-
-      // Start hold progress reporting and completion timer
-      this.startHoldCheck(expectedNotes);
-    } else {
-      this.wrongCount++;
-      this.callbacks.onNoteWrong(expectedNotes[0], event.note);
-    }
+    // Backdate the physical time by detection latency for accurate timing.
+    this.tryRecordAttempt(event.note, 'mic', performance.now() - MIC_DETECTION_LATENCY_MS);
   };
 
-  private startHoldCheck(expectedNotes: string[]): void {
-    const checkHold = (): void => {
-      if (!this.active || !this.holdingCorrectNote) return;
+  private tryRecordAttempt(note: string, source: 'mic' | 'click', physicalTime: number): void {
+    if (this.cursor < 0 || this.cursor >= this.schedule.length) return;
+    const slot = this.schedule[this.cursor];
+    if (slot.rest) return;
 
-      const now = performance.now();
-      const elapsed = now - this.holdStartTime;
-      const progress = Math.min(elapsed / this.holdDurationMs, 1);
+    const isCorrect = slot.expectedNotes.some(en => notesEqual(en, note));
 
-      // Check if the note is still being detected (within a tolerance window).
-      // Piano notes ring out, so we allow a gap of up to 300ms without detection
-      // before considering the note "dropped".
-      const timeSinceLastDetection = now - this.lastDetectedTime;
-      const stillHolding = timeSinceLastDetection < 300 &&
-        expectedNotes.some(en => notesEqual(en, this.lastDetectedNote));
-
-      if (!stillHolding && elapsed < this.holdDurationMs) {
-        // Note was released or changed before the full duration — cancel hold
-        this.cancelHold();
-        // Don't count as wrong, just reset — they need to play it again
-        this.callbacks.onHoldProgress(this.cursor, 0);
+    if (isCorrect) {
+      // Keep only the first correct attempt for this slot.
+      if (!this.slotAttempt) {
+        const elapsedAtPress = physicalTime - this.startTime;
+        this.slotAttempt = {
+          startMs: elapsedAtPress,
+          releaseMs: elapsedAtPress,
+          note,
+          source,
+        };
+        this.callbacks.onNoteCorrect(this.cursor, note);
+      }
+    } else {
+      // Suppress mic resonance from the previous slot's note immediately
+      // after a cursor advance.
+      const sinceAdvance = performance.now() - this.cursorAdvanceTime;
+      if (
+        source === 'mic' &&
+        this.prevSlotNote &&
+        notesEqual(note, this.prevSlotNote) &&
+        sinceAdvance < RESONANCE_GUARD_MS
+      ) {
         return;
       }
+      this.wrongCount++;
+      this.callbacks.onNoteWrong(slot.expectedNotes[0] || '', note);
+    }
+  }
 
-      this.callbacks.onHoldProgress(this.cursor, progress);
+  private tick = (): void => {
+    if (!this.active) return;
 
-      if (elapsed >= this.holdDurationMs) {
-        // Note held for full duration — advance!
-        this.holdingCorrectNote = false;
-        this.correctCount++;
-        this.callbacks.onNoteAdvance(this.cursor);
-        this.cursor++;
-        this.skipRests();
+    const now = performance.now();
+    const elapsed = now - this.startTime;
 
-        // Check if exercise is complete
-        if (this.cursor >= this.exercise.notes.length) {
-          this.active = false;
-          const score = calculateScore(
-            this.exercise.notes.filter(n => !n.rest).length,
-            this.correctCount,
-            this.wrongCount
-          );
-          this.callbacks.onComplete(score);
-        }
-        return;
+    // Determine which slot the timeline is currently in.
+    let newCursor = -1;
+    for (let i = 0; i < this.schedule.length; i++) {
+      if (elapsed >= this.schedule[i].startMs) newCursor = i;
+      else break;
+    }
+
+    // Update slotAttempt's release time while the note is still sounding.
+    if (this.slotAttempt) {
+      const heldByClick = this.heldNote !== null && notesEqual(this.heldNote, this.slotAttempt.note);
+      const heldByMic = (now - this.lastDetectedTime) < MIC_HOLD_TOLERANCE_MS &&
+        notesEqual(this.lastDetectedNote, this.slotAttempt.note);
+
+      if (heldByClick) {
+        this.slotAttempt.releaseMs = now - this.startTime;
+      } else if (heldByMic) {
+        this.slotAttempt.releaseMs = this.lastDetectedTime - this.startTime;
       }
+    }
 
-      // Keep checking
-      this.holdCheckId = requestAnimationFrame(checkHold);
-    };
+    // Advance the cursor in real time. Each crossing finalizes the slot we're leaving.
+    while (this.cursor < newCursor) {
+      if (this.cursor >= 0) {
+        this.finalizeSlot(this.cursor);
+      }
+      this.cursor++;
+      this.cursorAdvanceTime = now;
+      const slot = this.schedule[this.cursor];
+      if (slot) {
+        this.callbacks.onCursorAdvance(this.cursor, slot.rest ? null : slot.expectedNotes[0] || null);
+      }
+    }
 
-    this.holdCheckId = requestAnimationFrame(checkHold);
+    // Slot progress (0..1 through the current slot)
+    if (this.cursor >= 0 && this.cursor < this.schedule.length) {
+      const slot = this.schedule[this.cursor];
+      const slotDuration = slot.endMs - slot.startMs;
+      const progress = slotDuration > 0
+        ? Math.min(Math.max((elapsed - slot.startMs) / slotDuration, 0), 1)
+        : 1;
+      this.callbacks.onSlotProgress(this.cursor, progress);
+    }
+
+    // End of exercise.
+    if (elapsed >= this.totalMs) {
+      if (this.cursor >= 0 && this.cursor < this.schedule.length) {
+        this.finalizeSlot(this.cursor);
+      }
+      this.complete();
+      return;
+    }
+
+    this.rafId = requestAnimationFrame(this.tick);
+  };
+
+  private finalizeSlot(index: number): void {
+    const slot = this.schedule[index];
+    if (!slot) return;
+
+    if (slot.rest) {
+      this.slotAttempt = null;
+      this.prevSlotNote = null;
+      return;
+    }
+
+    if (this.slotAttempt) {
+      const startMs = this.slotAttempt.startMs;
+      const durationMs = Math.max(this.slotAttempt.releaseMs - this.slotAttempt.startMs, 30);
+      const played: PlayedNote = {
+        note: this.slotAttempt.note,
+        expectedNote: slot.expectedNotes[0] || '',
+        expectedIndex: index,
+        startMs,
+        durationMs,
+        expectedStartMs: slot.startMs,
+        expectedDurationMs: slot.endMs - slot.startMs,
+        source: this.slotAttempt.source,
+      };
+      this.playedNotes.push(played);
+      this.callbacks.onPlayedNote(played);
+      this.prevSlotNote = this.slotAttempt.note;
+    } else {
+      this.callbacks.onMissed(index, slot.expectedNotes[0] || '');
+      this.prevSlotNote = null;
+    }
+
+    this.slotAttempt = null;
+  }
+
+  private complete(): void {
+    this.active = false;
+    if (this.rafId) cancelAnimationFrame(this.rafId);
+    this.rafId = 0;
+    if (this.unsubscribe) {
+      this.unsubscribe();
+      this.unsubscribe = null;
+    }
+
+    const totalNotes = this.exercise.notes.filter(n => !n.rest).length;
+    const correctCount = this.playedNotes.length;
+    const score = calculateScore(totalNotes, correctCount, this.wrongCount);
+    this.callbacks.onComplete(score, this.playedNotes);
   }
 }

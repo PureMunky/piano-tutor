@@ -29,20 +29,23 @@ export class PianoKeyboard {
   private viewportStart: string = 'C3';
   private viewportEnd: string = 'C6';
   private showLabels: boolean = true;
-  private onClick?: (note: string) => void;
+  private onPress?: (note: string) => void;
+  private onRelease?: (note: string) => void;
 
   constructor(container: HTMLElement, options?: {
     viewportStart?: string;
     viewportEnd?: string;
     showLabels?: boolean;
-    onClick?: (note: string) => void;
+    onPress?: (note: string) => void;
+    onRelease?: (note: string) => void;
   }) {
     this.container = container;
     this.allKeys = generateKeys88();
     if (options?.viewportStart) this.viewportStart = options.viewportStart;
     if (options?.viewportEnd) this.viewportEnd = options.viewportEnd;
     if (options?.showLabels !== undefined) this.showLabels = options.showLabels;
-    if (options?.onClick) this.onClick = options.onClick;
+    if (options?.onPress) this.onPress = options.onPress;
+    if (options?.onRelease) this.onRelease = options.onRelease;
     this.render();
   }
 
@@ -152,19 +155,32 @@ export class PianoKeyboard {
   }
 
   private addKeyListeners(el: HTMLElement, note: string): void {
-    el.addEventListener('mousedown', (e) => {
+    let pressed = false;
+
+    const press = (e: Event) => {
       e.preventDefault();
+      if (pressed) return;
+      pressed = true;
       el.classList.add('active');
-      this.onClick?.(note);
-    });
+      this.onPress?.(note);
 
-    el.addEventListener('mouseup', () => {
-      el.classList.remove('active');
-    });
+      const release = () => {
+        if (!pressed) return;
+        pressed = false;
+        el.classList.remove('active');
+        this.onRelease?.(note);
+        document.removeEventListener('mouseup', release);
+        document.removeEventListener('touchend', release);
+        document.removeEventListener('touchcancel', release);
+      };
 
-    el.addEventListener('mouseleave', () => {
-      el.classList.remove('active');
-    });
+      document.addEventListener('mouseup', release);
+      document.addEventListener('touchend', release);
+      document.addEventListener('touchcancel', release);
+    };
+
+    el.addEventListener('mousedown', press);
+    el.addEventListener('touchstart', press, { passive: false });
   }
 
   highlightExpected(notes: string[]): void {

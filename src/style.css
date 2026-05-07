@@ -621,6 +621,159 @@ html, body {
   transition: width 0.05s linear;
 }
 
+/* ── Timing Graph ── */
+.timing-graph {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  font-size: 0.85rem;
+}
+
+.timing-graph-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  color: var(--text-secondary);
+}
+
+.timing-graph-legend {
+  display: flex;
+  gap: 14px;
+  font-size: 0.75rem;
+}
+
+.timing-graph-legend .swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+
+.timing-graph-legend .swatch.ideal { background: #3b82f6; }
+.timing-graph-legend .swatch.good { background: #22c55e; }
+.timing-graph-legend .swatch.off { background: #f59e0b; }
+.timing-graph-legend .swatch.missed {
+  background: rgba(239, 68, 68, 0.2);
+  border: 1px dashed #ef4444;
+  box-sizing: border-box;
+}
+
+.timing-tracks {
+  display: grid;
+  grid-template-columns: 40px 1fr;
+  gap: 6px 8px;
+  align-items: center;
+}
+
+.timing-track-label {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  text-align: right;
+}
+
+.timing-track {
+  position: relative;
+  height: 32px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.timing-track .beat-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.08);
+  pointer-events: none;
+}
+
+.timing-track .beat-tick.measure {
+  background: rgba(255, 255, 255, 0.18);
+  width: 1px;
+}
+
+.timing-track .beat-label {
+  position: absolute;
+  bottom: -16px;
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+  transform: translateX(2px);
+  pointer-events: none;
+}
+
+.timing-track .bar {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  padding: 0 4px;
+  overflow: hidden;
+  white-space: nowrap;
+  box-sizing: border-box;
+}
+
+.timing-track .bar-label {
+  font-size: 0.7rem;
+  color: rgba(255, 255, 255, 0.95);
+  font-weight: 500;
+  pointer-events: none;
+}
+
+.timing-track .bar.ideal {
+  background: #3b82f6;
+  border: 1px solid #2563eb;
+}
+
+.timing-track .bar.rest {
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(255, 255, 255, 0.04),
+    rgba(255, 255, 255, 0.04) 4px,
+    rgba(255, 255, 255, 0.08) 4px,
+    rgba(255, 255, 255, 0.08) 8px
+  );
+}
+
+.timing-track .bar.played.good {
+  background: #22c55e;
+  border: 1px solid #16a34a;
+}
+
+.timing-track .bar.played.off {
+  background: #f59e0b;
+  border: 1px solid #d97706;
+}
+
+.timing-track .bar.missed {
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px dashed #ef4444;
+}
+
+.timing-track .bar.missed .bar-label {
+  color: #fca5a5;
+  font-size: 0.65rem;
+}
+
+.timing-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+  pointer-events: none;
+  transition: left 0.05s linear;
+}
+
 /* ── Hand diagram ── */
 .hand-diagram {
   display: flex;

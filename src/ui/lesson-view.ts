@@ -4,8 +4,9 @@ import { PianoKeyboard } from './piano-keyboard';
 import { SheetMusic } from './sheet-music';
 import { ExerciseRunner } from '../engine/exercise-runner';
 import { pitchDetector } from '../core/pitch-detector';
-import { playSequence, playNote, startAudio, stopPlayback } from '../core/audio-player';
+import { playSequence, startAudio, stopPlayback, triggerAttack, triggerRelease } from '../core/audio-player';
 import { startMetronome, stopMetronome, setBpm, setTimeSignature, isRunning as isMetronomeRunning } from '../core/metronome';
+import { TimingGraph } from './timing-graph';
 import { markLessonComplete, saveExerciseScore, updateCurrentPosition } from '../core/progress-store';
 import { loadSettings } from '../core/settings-store';
 import { vexKeyToNoteName } from '../core/note-utils';
@@ -14,6 +15,19 @@ import { navigate } from './router';
 let activeRunner: ExerciseRunner | null = null;
 let activeKeyboard: PianoKeyboard | null = null;
 let activeSheetMusic: SheetMusic | null = null;
+let activeTimingGraph: TimingGraph | null = null;
+
+// Shared press/release helpers for on-screen piano. During an exercise
+// these also feed the runner so clicked notes count toward holds.
+function pianoPress(note: string): void {
+  startAudio().then(() => triggerAttack(note));
+  activeRunner?.noteOn(note);
+}
+
+function pianoRelease(note: string): void {
+  triggerRelease(note);
+  activeRunner?.noteOff(note);
+}
 
 function cleanup(): void {
   activeRunner?.stop();
@@ -22,6 +36,8 @@ function cleanup(): void {
   activeKeyboard = null;
   activeSheetMusic?.destroy();
   activeSheetMusic = null;
+  activeTimingGraph?.destroy();
+  activeTimingGraph = null;
   stopMetronome();
   stopPlayback();
   pitchDetector.stopListening();
@@ -157,6 +173,8 @@ function renderStep(step: LessonStep, container: HTMLElement, lesson: Lesson): v
   activeRunner = null;
   activeSheetMusic?.destroy();
   activeSheetMusic = null;
+  activeTimingGraph?.destroy();
+  activeTimingGraph = null;
   stopMetronome();
 
   container.innerHTML = '';
@@ -193,9 +211,8 @@ function renderInstructionStep(step: InstructionStep, container: HTMLElement): v
     activeKeyboard = new PianoKeyboard(kbContainer, {
       viewportStart: start,
       viewportEnd: end,
-      onClick: (note) => {
-        startAudio().then(() => playNote(note, '4n'));
-      },
+      onPress: pianoPress,
+      onRelease: pianoRelease,
     });
     activeKeyboard.highlightExpected(notes);
 
@@ -281,9 +298,8 @@ function renderDemoStep(step: DemoStep, container: HTMLElement): void {
   activeKeyboard = new PianoKeyboard(kbContainer, {
     viewportStart: 'C3',
     viewportEnd: 'C6',
-    onClick: (note) => {
-      startAudio().then(() => playNote(note, '4n'));
-    },
+    onPress: pianoPress,
+    onRelease: pianoRelease,
   });
 }
 
@@ -314,18 +330,6 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
   feedback.innerHTML = `<span class="status-text">Press "Start" to begin. The metronome will count you in.</span>`;
   container.appendChild(feedback);
 
-  // Hold progress bar (shown during note holds)
-  const holdBar = document.createElement('div');
-  holdBar.className = 'hold-progress-container';
-  holdBar.style.display = 'none';
-  holdBar.innerHTML = `
-    <div class="hold-progress-label">Hold the note...</div>
-    <div class="hold-progress-bar">
-      <div class="hold-progress-fill" id="hold-fill"></div>
-    </div>
-  `;
-  container.appendChild(holdBar);
-
   // Piano keyboard
   const kbContainer = document.createElement('div');
   container.appendChild(kbContainer);
@@ -336,10 +340,15 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
   activeKeyboard = new PianoKeyboard(kbContainer, {
     viewportStart,
     viewportEnd,
-    onClick: (note) => {
-      startAudio().then(() => playNote(note, '4n'));
-    },
+    onPress: pianoPress,
+    onRelease: pianoRelease,
   });
+
+  // Timing graph (ideal vs played)
+  const timingContainer = document.createElement('div');
+  container.appendChild(timingContainer);
+  activeTimingGraph = new TimingGraph(timingContainer);
+  activeTimingGraph.setExercise(step.notes, step.bpm, step.timeSignature[0]);
 
   // Show expected notes and finger numbers
   const firstNoteKeys = step.notes[0]?.keys.map(k => vexKeyToNoteName(k)) || [];
@@ -378,7 +387,6 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
   const bpmSlider = controls.querySelector('#bpm-slider') as HTMLInputElement;
   const bpmDisplay = controls.querySelector('#bpm-display') as HTMLElement;
   const hearItBtn = controls.querySelector('#play-demo-ex') as HTMLButtonElement;
-  const holdFill = holdBar.querySelector('#hold-fill') as HTMLElement;
 
   // BPM slider
   bpmSlider.addEventListener('input', () => {
@@ -389,6 +397,9 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
     }
     if (activeRunner) {
       activeRunner.setBpm(bpm);
+    }
+    if (!exerciseRunning) {
+      activeTimingGraph?.setExercise(step.notes, bpm, step.timeSignature[0]);
     }
   });
 
@@ -435,7 +446,8 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
     pitchDetector.stopListening();
     activeSheetMusic?.clearHighlights();
     activeKeyboard?.clearHighlights();
-    holdBar.style.display = 'none';
+    activeTimingGraph?.stopPlayhead();
+    activeTimingGraph?.setExercise(step.notes, parseInt(bpmSlider.value), step.timeSignature[0]);
 
     // Remove score display if present
     const scoreDiv = container.querySelector('.score-display');
@@ -504,68 +516,58 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
 
       // Now start listening
       micLabel.textContent = 'Listening...';
-      feedback.innerHTML = '<span class="status-text">Play the highlighted notes — hold each note for its full duration.</span>';
+      feedback.innerHTML = '<span class="status-text">Play each note in time with the metronome.</span>';
 
-      // Highlight first note on sheet music
-      activeSheetMusic?.clearHighlights();
-      activeSheetMusic?.highlightNote(0, '#3b82f6');
+      // Reset timing graph and start its playhead in sync with the exercise
+      activeTimingGraph?.setExercise(step.notes, bpm, step.timeSignature[0]);
+      activeTimingGraph?.startPlayhead();
 
       activeRunner = new ExerciseRunner(step, {
         onNoteDetected: (note) => {
           activeKeyboard?.highlightPlayed(note, false);
         },
-        onNoteCorrect: (index, note) => {
+        onCursorAdvance: (index, _expectedNote) => {
+          activeSheetMusic?.clearHighlights();
           activeKeyboard?.clearHighlights();
-          activeKeyboard?.highlightPlayed(note, true);
-          activeSheetMusic?.highlightNote(index, '#f59e0b');
 
-          holdBar.style.display = '';
-          holdFill.style.width = '0%';
-
-          feedback.className = 'exercise-feedback correct';
-          feedback.innerHTML = `<span class="status-text">Good — hold ${note}...</span>`;
-        },
-        onHoldProgress: (_index, progress) => {
-          holdFill.style.width = `${Math.round(progress * 100)}%`;
-          if (progress === 0) {
-            holdBar.style.display = 'none';
-            feedback.className = 'exercise-feedback wrong';
-            feedback.innerHTML = '<span class="status-text">Note released too early — play it again and hold longer.</span>';
-
-            const cursor = activeRunner?.getCursor() ?? 0;
-            if (cursor < step.notes.length) {
-              activeSheetMusic?.highlightNote(cursor, '#3b82f6');
-              const noteKeys = step.notes[cursor].keys.map(k => vexKeyToNoteName(k));
-              activeKeyboard?.clearHighlights();
+          if (index < step.notes.length) {
+            const note = step.notes[index];
+            if (!note.rest) {
+              activeSheetMusic?.highlightNote(index, '#3b82f6');
+              const noteKeys = note.keys.map(k => vexKeyToNoteName(k));
               activeKeyboard?.highlightExpected(noteKeys);
             }
           }
         },
-        onNoteAdvance: (index) => {
-          holdBar.style.display = 'none';
+        onNoteCorrect: (index, note) => {
+          activeKeyboard?.highlightPlayed(note, true);
           activeSheetMusic?.highlightNote(index, '#22c55e');
 
-          const nextIndex = index + 1;
-          if (nextIndex < step.notes.length && !step.notes[nextIndex].rest) {
-            activeSheetMusic?.highlightNote(nextIndex, '#3b82f6');
-            const nextNotes = step.notes[nextIndex].keys.map(k => vexKeyToNoteName(k));
-            activeKeyboard?.clearHighlights();
-            activeKeyboard?.highlightExpected(nextNotes);
-          }
-
-          const remaining = step.notes.filter(n => !n.rest).length - (nextIndex);
           feedback.className = 'exercise-feedback correct';
-          feedback.innerHTML = `<span class="status-text">Correct! ${remaining > 0 ? remaining + ' notes remaining.' : 'Finishing...'}</span>`;
+          feedback.innerHTML = `<span class="status-text">Good — ${note}</span>`;
+        },
+        onSlotProgress: (_index, _progress) => {
+          // Reserved for future use; the timing-graph playhead already shows progress.
+        },
+        onPlayedNote: (played) => {
+          activeTimingGraph?.addPlayedNote(played);
+        },
+        onMissed: (index, expected) => {
+          activeSheetMusic?.highlightNote(index, '#ef4444');
+          activeTimingGraph?.addMissed(index);
+          feedback.className = 'exercise-feedback wrong';
+          feedback.innerHTML = `<span class="status-text">Missed ${expected} — keep going.</span>`;
         },
         onNoteWrong: (expected, played) => {
           activeKeyboard?.highlightPlayed(played, false);
           feedback.className = 'exercise-feedback wrong';
           feedback.innerHTML = `<span class="status-text">That was ${played} — play ${expected}</span>`;
         },
-        onComplete: (score) => {
+        onComplete: (score, played) => {
           exerciseRunning = false;
           stopMetronome();
-          holdBar.style.display = 'none';
+          activeTimingGraph?.stopPlayhead();
+          activeTimingGraph?.setPlayedNotes(played);
           micDot.classList.remove('listening');
           micLabel.textContent = 'Complete';
           startBtn.style.display = 'none';
