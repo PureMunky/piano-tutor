@@ -34,9 +34,6 @@ interface Slot {
 
 const MIC_DETECTION_LATENCY_MS = 90;
 const MIC_HOLD_TOLERANCE_MS = 180;
-// Ignore mic detections of the previous slot's note for this long after
-// a cursor advance — it's almost certainly the previous note still ringing.
-const RESONANCE_GUARD_MS = 200;
 
 function durationToBeats(dur: string): number {
   switch (dur) {
@@ -71,13 +68,13 @@ export class ExerciseRunner {
 
   private slotAttempt: { startMs: number; releaseMs: number; note: string; source: 'mic' | 'click' } | null = null;
   private wrongCount: number = 0;
+  private wrongNotesThisSlot: Set<string> = new Set();
   private playedNotes: PlayedNote[] = [];
 
   private heldNote: string | null = null;
   private lastDetectedNote: string = '';
   private lastDetectedTime: number = 0;
   private prevSlotNote: string | null = null;
-  private cursorAdvanceTime: number = 0;
 
   constructor(exercise: ExerciseStep, callbacks: ExerciseCallback, bpm: number) {
     this.exercise = exercise;
@@ -112,13 +109,13 @@ export class ExerciseRunner {
   async start(): Promise<void> {
     this.cursor = -1;
     this.wrongCount = 0;
+    this.wrongNotesThisSlot.clear();
     this.playedNotes = [];
     this.slotAttempt = null;
     this.heldNote = null;
     this.prevSlotNote = null;
     this.active = true;
     this.startTime = performance.now();
-    this.cursorAdvanceTime = this.startTime;
 
     if (!pitchDetector.isListening()) {
       await pitchDetector.startListening();
@@ -198,17 +195,19 @@ export class ExerciseRunner {
         this.callbacks.onNoteCorrect(this.cursor, note);
       }
     } else {
-      // Suppress mic resonance from the previous slot's note immediately
-      // after a cursor advance.
-      const sinceAdvance = performance.now() - this.cursorAdvanceTime;
-      if (
-        source === 'mic' &&
-        this.prevSlotNote &&
-        notesEqual(note, this.prevSlotNote) &&
-        sinceAdvance < RESONANCE_GUARD_MS
-      ) {
+      // Once the user has played the correct note for this slot, every other
+      // mic detection in the slot is residual sound — don't count it.
+      if (this.slotAttempt) return;
+      // Mic resonance from the previous slot's note rings out into this slot;
+      // suppress it for the duration of the slot.
+      if (source === 'mic' && this.prevSlotNote && notesEqual(note, this.prevSlotNote)) {
         return;
       }
+      // Only count each unique wrong note once per slot — repeated detections
+      // of the same incorrect note are detection noise, not extra attempts.
+      const key = note.toUpperCase();
+      if (this.wrongNotesThisSlot.has(key)) return;
+      this.wrongNotesThisSlot.add(key);
       this.wrongCount++;
       this.callbacks.onNoteWrong(slot.expectedNotes[0] || '', note);
     }
@@ -246,7 +245,7 @@ export class ExerciseRunner {
         this.finalizeSlot(this.cursor);
       }
       this.cursor++;
-      this.cursorAdvanceTime = now;
+      this.wrongNotesThisSlot.clear();
       const slot = this.schedule[this.cursor];
       if (slot) {
         this.callbacks.onCursorAdvance(this.cursor, slot.rest ? null : slot.expectedNotes[0] || null);
@@ -319,8 +318,7 @@ export class ExerciseRunner {
     }
 
     const totalNotes = this.exercise.notes.filter(n => !n.rest).length;
-    const correctCount = this.playedNotes.length;
-    const score = calculateScore(totalNotes, correctCount, this.wrongCount);
+    const score = calculateScore(totalNotes, this.playedNotes, this.wrongCount);
     this.callbacks.onComplete(score, this.playedNotes);
   }
 }
