@@ -1,25 +1,28 @@
 import * as Tone from 'tone';
 
 let metronomeLoop: Tone.Loop | null = null;
-let clickSynth: Tone.Synth | null = null;
-let accentSynth: Tone.Synth | null = null;
+let clickSynth: Tone.NoiseSynth | null = null;
+let accentSynth: Tone.NoiseSynth | null = null;
 let running = false;
 let beatCount = 0;
 let beatsPerMeasure = 4;
 
 function ensureSynths(): void {
   if (!clickSynth) {
-    clickSynth = new Tone.Synth({
-      oscillator: { type: 'triangle' },
-      envelope: { attack: 0.001, decay: 0.1, sustain: 0, release: 0.05 },
-      volume: -10,
+    // Use very short noise bursts instead of pitched tones.
+    // Noise is broadband but the extremely short duration (5ms)
+    // plus the mic's low-pass filter makes it nearly inaudible to detection.
+    clickSynth = new Tone.NoiseSynth({
+      noise: { type: 'white' },
+      envelope: { attack: 0.001, decay: 0.03, sustain: 0, release: 0.01 },
+      volume: -14,
     }).toDestination();
   }
   if (!accentSynth) {
-    accentSynth = new Tone.Synth({
-      oscillator: { type: 'triangle' },
-      envelope: { attack: 0.001, decay: 0.1, sustain: 0, release: 0.05 },
-      volume: -6,
+    accentSynth = new Tone.NoiseSynth({
+      noise: { type: 'white' },
+      envelope: { attack: 0.001, decay: 0.05, sustain: 0, release: 0.01 },
+      volume: -10,
     }).toDestination();
   }
 }
@@ -41,9 +44,9 @@ export function startMetronome(bpm?: number): void {
 
   metronomeLoop = new Tone.Loop((time) => {
     if (beatCount % beatsPerMeasure === 0) {
-      accentSynth!.triggerAttackRelease('C6', '32n', time);
+      accentSynth!.triggerAttackRelease('32n', time);
     } else {
-      clickSynth!.triggerAttackRelease('G5', '32n', time);
+      clickSynth!.triggerAttackRelease('32n', time);
     }
     beatCount++;
   }, '4n');

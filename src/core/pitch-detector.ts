@@ -48,9 +48,26 @@ export class PitchDetector {
       this.audioContext = new AudioContext();
       const source = this.audioContext.createMediaStreamSource(this.stream);
 
+      // Chain two low-pass filters at 600 Hz for a steep rolloff.
+      // This blocks metronome noise from the mic signal while passing
+      // all beginner piano notes (C3=131Hz to C5=523Hz).
+      const lowpass1 = this.audioContext.createBiquadFilter();
+      lowpass1.type = 'lowpass';
+      lowpass1.frequency.value = 600;
+      lowpass1.Q.value = 0.7;
+
+      const lowpass2 = this.audioContext.createBiquadFilter();
+      lowpass2.type = 'lowpass';
+      lowpass2.frequency.value = 600;
+      lowpass2.Q.value = 0.7;
+
       this.analyser = this.audioContext.createAnalyser();
-      this.analyser.fftSize = 4096; // Better accuracy for piano
-      source.connect(this.analyser);
+      this.analyser.fftSize = 4096;
+
+      // Route: mic → lowpass1 → lowpass2 → analyser
+      source.connect(lowpass1);
+      lowpass1.connect(lowpass2);
+      lowpass2.connect(this.analyser);
 
       const bufferLength = this.analyser.fftSize;
       this.buffer = new Float32Array(bufferLength);

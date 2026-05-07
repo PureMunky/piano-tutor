@@ -5,7 +5,7 @@ import { SheetMusic } from './sheet-music';
 import { ExerciseRunner } from '../engine/exercise-runner';
 import { pitchDetector } from '../core/pitch-detector';
 import { playSequence, playNote, startAudio, stopPlayback } from '../core/audio-player';
-import { startMetronome, stopMetronome, setBpm, setTimeSignature } from '../core/metronome';
+import { startMetronome, stopMetronome, setBpm, setTimeSignature, isRunning as isMetronomeRunning } from '../core/metronome';
 import { markLessonComplete, saveExerciseScore, updateCurrentPosition } from '../core/progress-store';
 import { loadSettings } from '../core/settings-store';
 import { vexKeyToNoteName } from '../core/note-utils';
@@ -199,7 +199,6 @@ function renderInstructionStep(step: InstructionStep, container: HTMLElement): v
     });
     activeKeyboard.highlightExpected(notes);
 
-    // Show finger numbers
     for (const [note, finger] of Object.entries(fingerMap)) {
       activeKeyboard.showFingerNumber(note, finger);
     }
@@ -312,8 +311,20 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
   // Feedback area
   const feedback = document.createElement('div');
   feedback.className = 'exercise-feedback';
-  feedback.innerHTML = `<span class="status-text">Press "Start" when ready, then play the notes shown above.</span>`;
+  feedback.innerHTML = `<span class="status-text">Press "Start" to begin. The metronome will count you in.</span>`;
   container.appendChild(feedback);
+
+  // Hold progress bar (shown during note holds)
+  const holdBar = document.createElement('div');
+  holdBar.className = 'hold-progress-container';
+  holdBar.style.display = 'none';
+  holdBar.innerHTML = `
+    <div class="hold-progress-label">Hold the note...</div>
+    <div class="hold-progress-bar">
+      <div class="hold-progress-fill" id="hold-fill"></div>
+    </div>
+  `;
+  container.appendChild(holdBar);
 
   // Piano keyboard
   const kbContainer = document.createElement('div');
@@ -352,7 +363,6 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
     <button class="btn" id="retry-exercise" style="display:none;">Retry</button>
     <div class="spacer"></div>
     <div class="metronome-widget">
-      <button class="btn" id="metronome-toggle">Metronome</button>
       <input type="range" id="bpm-slider" min="40" max="180" value="${step.bpm}">
       <span class="bpm-display" id="bpm-display">${step.bpm} BPM</span>
     </div>
@@ -367,28 +377,18 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
   const micLabel = controls.querySelector('#mic-label') as HTMLElement;
   const bpmSlider = controls.querySelector('#bpm-slider') as HTMLInputElement;
   const bpmDisplay = controls.querySelector('#bpm-display') as HTMLElement;
-  const metronomeBtn = controls.querySelector('#metronome-toggle') as HTMLButtonElement;
   const hearItBtn = controls.querySelector('#play-demo-ex') as HTMLButtonElement;
+  const holdFill = holdBar.querySelector('#hold-fill') as HTMLElement;
 
   // BPM slider
   bpmSlider.addEventListener('input', () => {
     const bpm = parseInt(bpmSlider.value);
     bpmDisplay.textContent = `${bpm} BPM`;
-    setBpm(bpm);
-  });
-
-  // Metronome toggle
-  let metronomeRunning = false;
-  metronomeBtn.addEventListener('click', async () => {
-    await startAudio();
-    metronomeRunning = !metronomeRunning;
-    if (metronomeRunning) {
-      setTimeSignature(step.timeSignature[0]);
-      startMetronome(parseInt(bpmSlider.value));
-      metronomeBtn.textContent = 'Stop Met.';
-    } else {
-      stopMetronome();
-      metronomeBtn.textContent = 'Metronome';
+    if (isMetronomeRunning()) {
+      setBpm(bpm);
+    }
+    if (activeRunner) {
+      activeRunner.setBpm(bpm);
     }
   });
 
@@ -396,6 +396,9 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
   hearItBtn.addEventListener('click', async () => {
     hearItBtn.disabled = true;
     hearItBtn.textContent = 'Playing...';
+    // Stop metronome while playing demo
+    const wasRunning = isMetronomeRunning();
+    if (wasRunning) stopMetronome();
     try {
       await playSequence(step.notes, parseInt(bpmSlider.value), (index) => {
         activeSheetMusic?.clearHighlights();
@@ -405,6 +408,10 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
       hearItBtn.disabled = false;
       hearItBtn.textContent = 'Hear It';
       activeSheetMusic?.clearHighlights();
+      // Restart metronome if exercise is active
+      if (wasRunning || activeRunner) {
+        startMetronome(parseInt(bpmSlider.value));
+      }
       // Re-highlight current cursor position if exercise is active
       if (activeRunner) {
         activeSheetMusic?.highlightNote(activeRunner.getCursor(), '#3b82f6');
@@ -412,16 +419,92 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
     }
   });
 
-  // Start exercise
+  // Track whether we're in count-in so stop can cancel it
+  let countInTimerId: ReturnType<typeof setTimeout> | null = null;
+  let exerciseRunning = false;
+
+  function resetToReady(): void {
+    exerciseRunning = false;
+    if (countInTimerId) {
+      clearTimeout(countInTimerId);
+      countInTimerId = null;
+    }
+    activeRunner?.stop();
+    activeRunner = null;
+    stopMetronome();
+    pitchDetector.stopListening();
+    activeSheetMusic?.clearHighlights();
+    activeKeyboard?.clearHighlights();
+    holdBar.style.display = 'none';
+
+    // Remove score display if present
+    const scoreDiv = container.querySelector('.score-display');
+    if (scoreDiv) scoreDiv.remove();
+
+    feedback.style.display = '';
+    feedback.className = 'exercise-feedback';
+    feedback.innerHTML = '<span class="status-text">Press "Start" to begin. The metronome will count you in.</span>';
+
+    startBtn.textContent = 'Start Exercise';
+    startBtn.disabled = false;
+    startBtn.classList.add('primary');
+    retryBtn.style.display = 'none';
+
+    micDot.classList.remove('listening');
+    micLabel.textContent = 'Mic off';
+
+    // Re-highlight first note
+    const firstNotes = step.notes[0]?.keys.map(k => vexKeyToNoteName(k)) || [];
+    activeKeyboard?.highlightExpected(firstNotes);
+
+    if (settings.showFingerNumbers && step.fingerNumbers) {
+      for (const [note, finger] of Object.entries(step.fingerNumbers)) {
+        activeKeyboard?.showFingerNumber(note, finger);
+      }
+    }
+  }
+
+  // Start/Stop exercise
   startBtn.addEventListener('click', async () => {
+    // If already running, stop everything
+    if (exerciseRunning) {
+      resetToReady();
+      return;
+    }
+
     try {
-      startBtn.disabled = true;
-      startBtn.textContent = 'Listening...';
+      await startAudio();
+
+      exerciseRunning = true;
+      startBtn.textContent = 'Stop';
+      startBtn.classList.remove('primary');
       micDot.classList.add('listening');
-      micLabel.textContent = 'Listening...';
+      micLabel.textContent = 'Count-in...';
 
       feedback.className = 'exercise-feedback';
-      feedback.innerHTML = '<span class="status-text">Play the highlighted notes on your piano...</span>';
+      feedback.innerHTML = '<span class="status-text">Listen to the count-in...</span>';
+
+      const bpm = parseInt(bpmSlider.value);
+
+      // Start metronome for a count-in (1 measure)
+      setTimeSignature(step.timeSignature[0]);
+      startMetronome(bpm);
+
+      // Wait for one measure of count-in (cancellable)
+      const countInMs = (step.timeSignature[0] * 60000) / bpm;
+      await new Promise<void>((resolve) => {
+        countInTimerId = setTimeout(() => {
+          countInTimerId = null;
+          resolve();
+        }, countInMs);
+      });
+
+      // If stopped during count-in, bail out
+      if (!exerciseRunning) return;
+
+      // Now start listening
+      micLabel.textContent = 'Listening...';
+      feedback.innerHTML = '<span class="status-text">Play the highlighted notes — hold each note for its full duration.</span>';
 
       // Highlight first note on sheet music
       activeSheetMusic?.clearHighlights();
@@ -429,44 +512,70 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
 
       activeRunner = new ExerciseRunner(step, {
         onNoteDetected: (note) => {
-          // Flash the detected note on keyboard
           activeKeyboard?.highlightPlayed(note, false);
         },
         onNoteCorrect: (index, note) => {
+          activeKeyboard?.clearHighlights();
           activeKeyboard?.highlightPlayed(note, true);
+          activeSheetMusic?.highlightNote(index, '#f59e0b');
+
+          holdBar.style.display = '';
+          holdFill.style.width = '0%';
+
+          feedback.className = 'exercise-feedback correct';
+          feedback.innerHTML = `<span class="status-text">Good — hold ${note}...</span>`;
+        },
+        onHoldProgress: (_index, progress) => {
+          holdFill.style.width = `${Math.round(progress * 100)}%`;
+          if (progress === 0) {
+            holdBar.style.display = 'none';
+            feedback.className = 'exercise-feedback wrong';
+            feedback.innerHTML = '<span class="status-text">Note released too early — play it again and hold longer.</span>';
+
+            const cursor = activeRunner?.getCursor() ?? 0;
+            if (cursor < step.notes.length) {
+              activeSheetMusic?.highlightNote(cursor, '#3b82f6');
+              const noteKeys = step.notes[cursor].keys.map(k => vexKeyToNoteName(k));
+              activeKeyboard?.clearHighlights();
+              activeKeyboard?.highlightExpected(noteKeys);
+            }
+          }
+        },
+        onNoteAdvance: (index) => {
+          holdBar.style.display = 'none';
           activeSheetMusic?.highlightNote(index, '#22c55e');
 
-          // Highlight next expected note
           const nextIndex = index + 1;
-          if (nextIndex < step.notes.length) {
+          if (nextIndex < step.notes.length && !step.notes[nextIndex].rest) {
             activeSheetMusic?.highlightNote(nextIndex, '#3b82f6');
             const nextNotes = step.notes[nextIndex].keys.map(k => vexKeyToNoteName(k));
             activeKeyboard?.clearHighlights();
             activeKeyboard?.highlightExpected(nextNotes);
           }
 
-          const remaining = step.notes.filter(n => !n.rest).length - (index + 1);
+          const remaining = step.notes.filter(n => !n.rest).length - (nextIndex);
           feedback.className = 'exercise-feedback correct';
-          feedback.innerHTML = `<span class="status-text">Correct! ${remaining} notes remaining.</span>`;
+          feedback.innerHTML = `<span class="status-text">Correct! ${remaining > 0 ? remaining + ' notes remaining.' : 'Finishing...'}</span>`;
         },
         onNoteWrong: (expected, played) => {
           activeKeyboard?.highlightPlayed(played, false);
           feedback.className = 'exercise-feedback wrong';
-          feedback.innerHTML = `<span class="status-text">That was ${played} — try ${expected}</span>`;
+          feedback.innerHTML = `<span class="status-text">That was ${played} — play ${expected}</span>`;
         },
         onComplete: (score) => {
+          exerciseRunning = false;
+          stopMetronome();
+          holdBar.style.display = 'none';
           micDot.classList.remove('listening');
           micLabel.textContent = 'Complete';
           startBtn.style.display = 'none';
           retryBtn.style.display = '';
 
-          // Save score
           const stepIndex = lesson.steps.indexOf(step);
           if (stepIndex >= 0) {
             saveExerciseScore(lesson.id, stepIndex, score);
           }
 
-          // Show score
           const scoreDiv = document.createElement('div');
           scoreDiv.className = `score-display ${score.passed ? 'passed' : 'failed'}`;
           scoreDiv.innerHTML = `
@@ -476,43 +585,19 @@ function renderExerciseStep(step: ExerciseStep, container: HTMLElement, lesson: 
           container.insertBefore(scoreDiv, feedback);
           feedback.style.display = 'none';
         },
-      });
+      }, bpm);
 
       await activeRunner.start();
     } catch (err) {
+      resetToReady();
       feedback.className = 'exercise-feedback wrong';
       feedback.innerHTML = `<span class="status-text">Could not access microphone. Please allow microphone access and try again.</span>`;
-      startBtn.disabled = false;
-      startBtn.textContent = 'Start Exercise';
-      micDot.classList.remove('listening');
-      micLabel.textContent = 'Mic error';
     }
   });
 
-  // Retry
+  // Retry (after completion)
   retryBtn.addEventListener('click', () => {
-    activeRunner?.reset();
-    activeSheetMusic?.clearHighlights();
-    activeKeyboard?.clearHighlights();
-
-    // Remove score display
-    const scoreDiv = container.querySelector('.score-display');
-    if (scoreDiv) scoreDiv.remove();
-
-    feedback.style.display = '';
-    feedback.className = 'exercise-feedback';
-    feedback.innerHTML = '<span class="status-text">Press "Start" when ready.</span>';
-
     startBtn.style.display = '';
-    startBtn.disabled = false;
-    startBtn.textContent = 'Start Exercise';
-    retryBtn.style.display = 'none';
-
-    micDot.classList.remove('listening');
-    micLabel.textContent = 'Mic off';
-
-    // Re-highlight first note
-    const firstNotes = step.notes[0]?.keys.map(k => vexKeyToNoteName(k)) || [];
-    activeKeyboard?.highlightExpected(firstNotes);
+    resetToReady();
   });
 }

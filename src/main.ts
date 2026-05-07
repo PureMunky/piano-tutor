@@ -1,8 +1,18 @@
 import './style.css';
-import { initRouter, registerRoute } from './ui/router';
+import { initRouter, registerRoute, onBeforeNavigate } from './ui/router';
 import { renderHomeView } from './ui/home-view';
 import { renderModuleView } from './ui/module-view';
 import { renderSettingsView } from './ui/settings-view';
+import { stopPlayback } from './core/audio-player';
+import { stopMetronome } from './core/metronome';
+import { pitchDetector } from './core/pitch-detector';
+
+// Global cleanup: stop all audio/mic on any route change
+onBeforeNavigate(() => {
+  stopPlayback();
+  stopMetronome();
+  pitchDetector.stopListening();
+});
 
 // Register routes
 registerRoute('/', renderHomeView);
@@ -10,7 +20,6 @@ registerRoute('/module/:id', (container, params) => {
   renderModuleView(container, params);
 });
 registerRoute('/lesson/:id', async (container, params) => {
-  // Lazy-load lesson view to keep initial bundle small
   const { renderLessonView } = await import('./ui/lesson-view');
   renderLessonView(container, params);
 });
