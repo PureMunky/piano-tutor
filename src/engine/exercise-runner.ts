@@ -32,6 +32,11 @@ interface Slot {
   rest: boolean;
 }
 
+// How far before a slot boundary a note press is considered "early for the next slot"
+// rather than "late for the current slot". This fixes the issue where hitting a note
+// slightly before the beat counts against the current slot instead of the next one.
+const EARLY_WINDOW_MS = 150;
+
 const MIC_DETECTION_LATENCY_MS = 90;
 const MIC_HOLD_TOLERANCE_MS = 180;
 
@@ -67,6 +72,8 @@ export class ExerciseRunner {
   private unsubscribe: (() => void) | null = null;
 
   private slotAttempt: { startMs: number; releaseMs: number; note: string; source: 'mic' | 'click' } | null = null;
+  // Buffer for notes that arrive early (before the next slot starts)
+  private earlyAttempt: { note: string; source: 'mic' | 'click'; physicalTime: number } | null = null;
   private wrongCount: number = 0;
   private wrongNotesThisSlot: Set<string> = new Set();
   private playedNotes: PlayedNote[] = [];
@@ -112,6 +119,7 @@ export class ExerciseRunner {
     this.wrongNotesThisSlot.clear();
     this.playedNotes = [];
     this.slotAttempt = null;
+    this.earlyAttempt = null;
     this.heldNote = null;
     this.prevSlotNote = null;
     this.active = true;
@@ -141,6 +149,7 @@ export class ExerciseRunner {
     this.wrongCount = 0;
     this.playedNotes = [];
     this.slotAttempt = null;
+    this.earlyAttempt = null;
   }
 
   getCursor(): number {
@@ -171,7 +180,6 @@ export class ExerciseRunner {
     this.lastDetectedTime = performance.now();
     this.callbacks.onNoteDetected(event.note);
 
-    // Backdate the physical time by detection latency for accurate timing.
     this.tryRecordAttempt(event.note, 'mic', performance.now() - MIC_DETECTION_LATENCY_MS);
   };
 
@@ -180,10 +188,27 @@ export class ExerciseRunner {
     const slot = this.schedule[this.cursor];
     if (slot.rest) return;
 
+    const elapsed = physicalTime - this.startTime;
     const isCorrect = slot.expectedNotes.some(en => notesEqual(en, note));
 
+    // Check if this note is actually early for the NEXT slot.
+    // If we're near the end of the current slot and the note matches the next slot
+    // (and doesn't match the current), buffer it for the next slot.
+    const nextSlotIndex = this.cursor + 1;
+    if (!isCorrect && nextSlotIndex < this.schedule.length) {
+      const nextSlot = this.schedule[nextSlotIndex];
+      const timeUntilNextSlot = nextSlot.startMs - elapsed;
+      const matchesNext = !nextSlot.rest && nextSlot.expectedNotes.some(en => notesEqual(en, note));
+
+      if (matchesNext && timeUntilNextSlot <= EARLY_WINDOW_MS && timeUntilNextSlot > 0) {
+        // This note is early for the next slot — buffer it instead of counting as wrong
+        this.earlyAttempt = { note, source, physicalTime };
+        return;
+      }
+    }
+
     if (isCorrect) {
-      // Keep only the first correct attempt for this slot.
+      // If user already played the right note for this slot, ignore repeated detections
       if (!this.slotAttempt) {
         const elapsedAtPress = physicalTime - this.startTime;
         this.slotAttempt = {
@@ -195,16 +220,13 @@ export class ExerciseRunner {
         this.callbacks.onNoteCorrect(this.cursor, note);
       }
     } else {
-      // Once the user has played the correct note for this slot, every other
-      // mic detection in the slot is residual sound — don't count it.
+      // Don't count wrong notes after the slot already has a correct attempt
       if (this.slotAttempt) return;
-      // Mic resonance from the previous slot's note rings out into this slot;
-      // suppress it for the duration of the slot.
+      // Suppress resonance from the previous slot's note
       if (source === 'mic' && this.prevSlotNote && notesEqual(note, this.prevSlotNote)) {
         return;
       }
-      // Only count each unique wrong note once per slot — repeated detections
-      // of the same incorrect note are detection noise, not extra attempts.
+      // Only count each unique wrong note once per slot
       const key = note.toUpperCase();
       if (this.wrongNotesThisSlot.has(key)) return;
       this.wrongNotesThisSlot.add(key);
@@ -249,6 +271,22 @@ export class ExerciseRunner {
       const slot = this.schedule[this.cursor];
       if (slot) {
         this.callbacks.onCursorAdvance(this.cursor, slot.rest ? null : slot.expectedNotes[0] || null);
+      }
+
+      // Check if we have a buffered early attempt that matches this new slot
+      if (this.earlyAttempt && this.cursor < this.schedule.length) {
+        const currentSlot = this.schedule[this.cursor];
+        if (!currentSlot.rest && currentSlot.expectedNotes.some(en => notesEqual(en, this.earlyAttempt!.note))) {
+          const elapsedAtPress = this.earlyAttempt.physicalTime - this.startTime;
+          this.slotAttempt = {
+            startMs: elapsedAtPress,
+            releaseMs: elapsedAtPress,
+            note: this.earlyAttempt.note,
+            source: this.earlyAttempt.source,
+          };
+          this.callbacks.onNoteCorrect(this.cursor, this.earlyAttempt.note);
+        }
+        this.earlyAttempt = null;
       }
     }
 

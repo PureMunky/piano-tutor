@@ -3,12 +3,17 @@ import type { PlayedNote } from './exercise-runner';
 
 export const PASS_THRESHOLD = 80;
 
-const TIMING_TOL_MS = 80;
-const DURATION_TOL_MS = 150;
+// How close to the beat start a note must be to count as "on time".
+// 150ms is generous enough to account for mic latency + human reaction.
+const TIMING_TOL_MS = 150;
+
+// How close to the expected duration the held duration must be.
+// 300ms allows for natural imprecision in release timing.
+const DURATION_TOL_MS = 300;
 
 const ON_TIME_CREDIT = 1.0;
 const OFF_BEAT_CREDIT = 0.6;
-const WRONG_PENALTY_PER_NOTE = 0.15; // each unique wrong note costs 15% of one note's worth
+const WRONG_PENALTY_PER_NOTE = 0.15;
 
 export function calculateScore(
   totalNotes: number,
