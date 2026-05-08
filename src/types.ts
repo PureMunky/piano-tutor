@@ -81,4 +81,5 @@ export interface UserSettings {
   micSensitivity: number; // clarity threshold 0.8-0.95
   showFingerNumbers: boolean;
   keyboardSize: 'compact' | 'full';
+  tuningOffsetCents: number; // how many cents sharp (+) or flat (-) the piano is from A440
 }

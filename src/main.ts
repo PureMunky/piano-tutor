@@ -6,6 +6,11 @@ import { renderSettingsView } from './ui/settings-view';
 import { stopPlayback } from './core/audio-player';
 import { stopMetronome } from './core/metronome';
 import { pitchDetector } from './core/pitch-detector';
+import { loadSettings } from './core/settings-store';
+import { setTuningOffset } from './core/note-utils';
+
+// Apply saved tuning offset on startup
+setTuningOffset(loadSettings().tuningOffsetCents);
 
 // Global cleanup: stop all audio/mic on any route change
 onBeforeNavigate(() => {

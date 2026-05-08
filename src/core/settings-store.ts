@@ -10,6 +10,7 @@ function defaultSettings(): UserSettings {
     micSensitivity: 0.9,
     showFingerNumbers: true,
     keyboardSize: 'compact',
+    tuningOffsetCents: 0,
   };
 }
 

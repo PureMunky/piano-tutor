@@ -1,6 +1,7 @@
 import { loadSettings, saveSettings, resetSettings } from '../core/settings-store';
 import { resetProgress } from '../core/progress-store';
 import { navigate } from './router';
+import { CalibrationTool } from './calibration';
 
 export function renderSettingsView(container: HTMLElement): void {
   const settings = loadSettings();
@@ -72,7 +73,22 @@ export function renderSettingsView(container: HTMLElement): void {
   `;
   wrapper.appendChild(sections);
 
+  // Calibration tool (separate DOM — manages its own lifecycle)
+  const calContainer = document.createElement('div');
+  wrapper.appendChild(calContainer);
+  const calibrationTool = new CalibrationTool(calContainer);
+
   container.appendChild(wrapper);
+
+  // Cleanup calibration mic if user navigates away (handled by router global cleanup,
+  // but also destroy here just in case the DOM is removed)
+  const observer = new MutationObserver(() => {
+    if (!container.contains(calContainer)) {
+      calibrationTool.destroy();
+      observer.disconnect();
+    }
+  });
+  observer.observe(container, { childList: true });
 
   // Bind events
   const micSlider = container.querySelector('#mic-sensitivity') as HTMLInputElement;

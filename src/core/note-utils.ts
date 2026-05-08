@@ -1,8 +1,28 @@
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
 
+// Tuning offset in cents. Set by the calibration tool.
+// Positive = piano is sharp (its A4 is higher than 440Hz).
+// This shifts the detection reference so notes still map correctly.
+let _tuningOffsetCents = 0;
+
+export function setTuningOffset(cents: number): void {
+  _tuningOffsetCents = cents;
+}
+
+export function getTuningOffset(): number {
+  return _tuningOffsetCents;
+}
+
+// Reference frequency for A4, adjusted by tuning offset.
+// If the piano is +10 cents sharp, its A4 is at ~442.5 Hz.
+// We shift our reference up so that 442.5 Hz maps back to MIDI 69 (A4).
+function refA4(): number {
+  return 440 * Math.pow(2, _tuningOffsetCents / 1200);
+}
+
 // Piano key number (1-88) where A4=49
 export function frequencyToMidi(freq: number): number {
-  return Math.round(12 * Math.log2(freq / 440) + 69);
+  return Math.round(12 * Math.log2(freq / refA4()) + 69);
 }
 
 export function midiToFrequency(midi: number): number {
@@ -41,7 +61,7 @@ export function frequencyToNoteName(freq: number): string {
 }
 
 export function frequencyToCentsOff(freq: number): number {
-  const midi = 12 * Math.log2(freq / 440) + 69;
+  const midi = 12 * Math.log2(freq / refA4()) + 69;
   const nearestMidi = Math.round(midi);
   return (midi - nearestMidi) * 100;
 }
